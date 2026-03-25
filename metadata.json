@@ -1,0 +1,7 @@
+{
+  "name": "Remix: VisionMaster Pro",
+  "description": "Professional AI-powered image background removal, signature extraction, and passport photo studio.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
