@@ -15,27 +15,88 @@ export class ApiService {
   }
 
   /**
+   * Helper to downscale image if it exceeds max dimensions
+   */
+  private static async downscaleImage(base64: string, maxDim: number = 1024): Promise<string> {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => {
+        if (img.width <= maxDim && img.height <= maxDim) {
+          resolve(base64);
+          return;
+        }
+
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          resolve(base64);
+          return;
+        }
+
+        let width = img.width;
+        let height = img.height;
+
+        if (width > height) {
+          if (width > maxDim) {
+            height *= maxDim / width;
+            width = maxDim;
+          }
+        } else {
+          if (height > maxDim) {
+            width *= maxDim / height;
+            height = maxDim;
+          }
+        }
+
+        canvas.width = width;
+        canvas.height = height;
+        ctx.drawImage(img, 0, 0, width, height);
+        resolve(canvas.toDataURL('image/png'));
+      };
+      img.onerror = () => resolve(base64);
+      img.src = base64;
+    });
+  }
+
+  /**
    * Local background removal via @imgly/background-removal
    */
-  static async removeBackground(base64Image: string, sensitivity: number = 50): Promise<string | null> {
+  static async removeBackground(
+    base64Image: string, 
+    onProgress?: (progress: number) => void
+  ): Promise<string | null> {
     try {
-      // Use the local library for "VisionClean" promise
-      const blob = await this.base64ToBlob(base64Image);
+      console.time("[VisionMaster] Background Removal");
       
-      // sensitivity is not directly supported by imgly, but we can use it to adjust post-processing if needed
-      // For now, we use the default high-quality removal
+      // 1. Downscale for performance if needed (1024px is usually enough for high quality)
+      const optimizedBase64 = await this.downscaleImage(base64Image, 1024);
+      
+      // 2. Convert to Blob
+      const blob = await this.base64ToBlob(optimizedBase64);
+      
+      // 3. Run neural engine
       const resultBlob = await removeBackground(blob, {
         progress: (step, index, total) => {
-          console.log(`[VisionMaster] ${step} ${index}/${total}`);
+          const progress = Math.round((index / total) * 100);
+          if (onProgress) onProgress(progress);
+          
+          // Log progress but don't spam too much
+          if (index % 5 === 0 || index === total) {
+            console.log(`[VisionMaster] ${step}: ${progress}%`);
+          }
         },
-        model: 'isnet', // Use standard model
+        model: 'isnet_quint8', // Quantized for speed
+        debug: false,
       });
 
-      return new Promise((resolve) => {
+      const result = await new Promise<string>((resolve) => {
         const reader = new FileReader();
         reader.onloadend = () => resolve(reader.result as string);
         reader.readAsDataURL(resultBlob);
       });
+
+      console.timeEnd("[VisionMaster] Background Removal");
+      return result;
     } catch (error) {
       console.error("[ApiService] Local Background Removal Error:", error);
       return null;
@@ -48,11 +109,12 @@ export class ApiService {
   static async processPassportPhoto(
     base64Image: string, 
     size: '2x2' | '35x45', 
-    backgroundColor: string
+    backgroundColor: string,
+    onProgress?: (progress: number) => void
   ): Promise<string | null> {
     try {
       // 1. Remove background locally
-      const transparentBase64 = await this.removeBackground(base64Image);
+      const transparentBase64 = await this.removeBackground(base64Image, onProgress);
       if (!transparentBase64) return null;
 
       // 2. Composite onto color background using Canvas
@@ -98,10 +160,13 @@ export class ApiService {
   /**
    * Local signature extraction via Canvas processing
    */
-  static async extractSignature(base64Image: string): Promise<string | null> {
+  static async extractSignature(
+    base64Image: string,
+    onProgress?: (progress: number) => void
+  ): Promise<string | null> {
     try {
       // 1. Remove background first
-      const transparentBase64 = await this.removeBackground(base64Image);
+      const transparentBase64 = await this.removeBackground(base64Image, onProgress);
       if (!transparentBase64) return null;
 
       // 2. Process to enhance ink and ensure transparency
@@ -132,14 +197,17 @@ export class ApiService {
             // If it's not transparent, check if it's "ink-like" (dark)
             if (a > 0) {
               const brightness = (r + g + b) / 3;
-              if (brightness > 180) {
-                // Make light pixels transparent (background remnants)
+              if (brightness > 200) {
+                // Make very light pixels transparent (background remnants)
                 data[i + 3] = 0;
               } else {
-                // Make dark pixels pure black for a clean signature
-                data[i] = 0;
-                data[i + 1] = 0;
-                data[i + 2] = 0;
+                // Preserve original color but ensure it's "solid"
+                // We don't force to black anymore to support blue/red ink
+                // Optional: increase contrast slightly
+                const factor = 1.2;
+                data[i] = Math.max(0, Math.min(255, r * factor - 50));
+                data[i + 1] = Math.max(0, Math.min(255, g * factor - 50));
+                data[i + 2] = Math.max(0, Math.min(255, b * factor - 50));
               }
             }
           }
